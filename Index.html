@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Pocket LLM</title>
+<style>
+  :root{--bg:#0e0f12;--panel:#17191e;--text:#e8eaed;--muted:#8b919c;--accent:#7c5cff;--user:#2a2d36;--border:#272a31}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:16px/1.45 -apple-system,system-ui,sans-serif}
+  body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+  header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border)}
+  header h1{font-size:17px;margin:0}
+  button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:8px 12px}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.5}
+  #setup{padding:14px;display:flex;flex-direction:column;gap:10px;overflow:auto}
+  select,input,textarea{width:100%;font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px}
+  label{font-size:13px;color:var(--muted)}
+  details{border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+  summary{color:var(--muted);font-size:14px}
+  #bar{height:8px;background:var(--panel);border-radius:6px;overflow:hidden;display:none}
+  #bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+  #status{font-size:13px;color:var(--muted);min-height:18px;white-space:pre-wrap}
+  #chat{flex:1;overflow:auto;padding:14px;display:none;flex-direction:column;gap:10px}
+  .msg{max-width:88%;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+  .msg.user{align-self:flex-end;background:var(--user)}
+  .msg.bot{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
+  #composer{display:none;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}
+  #composer textarea{resize:none;height:44px;max-height:120px}
+  .warn{color:#ffb454}
+</style>
+</head>
+<body>
+<header>
+  <h1>Pocket LLM</h1>
+  <div><button id="newBtn" style="display:none">New chat</button> <button id="menuBtn" style="display:none">Model</button></div>
+</header>
+
+<section id="setup">
+  <div id="support" class="warn"></div>
+  <div>
+    <label for="model">Model (runs 100% on your device after download)</label>
+    <select id="model">
+      <option value="SmolLM2-360M-Instruct-q4f32_1-MLC">SmolLM2 360M (~250 MB, fastest)</option>
+      <option value="Qwen2.5-0.5B-Instruct-q4f32_1-MLC" selected>Qwen2.5 0.5B (~400 MB, recommended)</option>
+      <option value="Qwen2.5-1.5B-Instruct-q4f32_1-MLC">Qwen2.5 1.5B (~1 GB, may crash on 4 GB iPhones)</option>
+      <option value="Llama-3.2-1B-Instruct-q4f32_1-MLC">Llama 3.2 1B (~900 MB)</option>
+      <option value="custom">Custom model (advanced)…</option>
+    </select>
+  </div>
+  <details id="customBox">
+    <summary>Custom model</summary>
+    <label>Model ID</label><input id="cId" placeholder="MyModel-q4f32_1-MLC">
+    <label>Weights URL (Hugging Face MLC repo)</label><input id="cUrl" placeholder="https://huggingface.co/user/model-MLC">
+    <label>Model library (.wasm) URL</label><input id="cLib" placeholder="https://.../model-webgpu.wasm">
+  </details>
+  <div>
+    <label for="sys">System prompt</label>
+    <textarea id="sys" rows="3">You are a helpful, direct assistant. Answer concisely.</textarea>
+  </div>
+  <button id="loadBtn" class="primary">Download &amp; start</button>
+  <div id="bar"><i></i></div>
+  <div id="status"></div>
+  <p style="font-size:12px;color:var(--muted)">Tip: Share → Add to Home Screen for a full-screen app. Models are cached, so later launches are quick.</p>
+</section>
+
+<main id="chat"></main>
+<form id="composer" onsubmit="return false">
+  <textarea id="input" placeholder="Message…" rows="1"></textarea>
+  <button id="sendBtn" class="primary">Send</button>
+</form>
+
+<script type="module">
+import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+
+const $ = id => document.getElementById(id);
+let engine = null, history = [], busy = false;
+
+if (!navigator.gpu) {
+  $("support").textContent = "WebGPU isn't available in this browser. On iPhone use Safari on iOS 26+ (or on iOS 18: Settings → Apps → Safari → Advanced → Feature Flags → WebGPU).";
+}
+
+function setProgress(p, text){
+  $("bar").style.display = "block";
+  $("bar").firstElementChild.style.width = Math.round(p*100) + "%";
+  $("status").textContent = text || "";
+}
+
+$("loadBtn").onclick = async () => {
+  if (!navigator.gpu) { $("status").textContent = "No WebGPU – can't continue."; return; }
+  $("loadBtn").disabled = true;
+  let modelId = $("model").value;
+  let appConfig = webllm.prebuiltAppConfig;
+  if (modelId === "custom") {
+    modelId = $("cId").value.trim();
+    const url = $("cUrl").value.trim(), lib = $("cLib").value.trim();
+    if (!modelId || !url || !lib) { $("status").textContent = "Fill in all custom fields."; $("loadBtn").disabled = false; return; }
+    appConfig = { ...webllm.prebuiltAppConfig, model_list: [...webllm.prebuiltAppConfig.model_list, { model: url, model_id: modelId, model_lib: lib }] };
+  }
+  try {
+    engine = await webllm.CreateMLCEngine(modelId, {
+      appConfig,
+      initProgressCallback: r => setProgress(r.progress || 0, r.text)
+    }, { context_window_size: 2048 });
+    history = [{ role: "system", content: $("sys").value }];
+    $("setup").style.display = "none";
+    $("chat").style.display = "flex";
+    $("composer").style.display = "flex";
+    $("newBtn").style.display = $("menuBtn").style.display = "inline-block";
+  } catch (e) {
+    $("status").textContent = "Failed to load: " + (e.message || e) + "\nTry a smaller model — iPhone tabs have tight memory limits.";
+    $("loadBtn").disabled = false;
+  }
+};
+
+$("menuBtn").onclick = () => {
+  $("setup").style.display = "flex"; $("chat").style.display = "none"; $("composer").style.display = "none";
+  $("loadBtn").disabled = false; $("bar").style.display = "none";
+};
+$("newBtn").onclick = () => { history = [{ role: "system", content: $("sys").value }]; $("chat").innerHTML = ""; };
+
+function addMsg(role, text){
+  const d = document.createElement("div");
+  d.className = "msg " + (role === "user" ? "user" : "bot");
+  d.textContent = text;
+  $("chat").appendChild(d);
+  $("chat").scrollTop = $("chat").scrollHeight;
+  return d;
+}
+
+async function send(){
+  if (busy) { engine.interruptGenerate(); return; }
+  const text = $("input").value.trim();
+  if (!text || !engine) return;
+  $("input").value = "";
+  addMsg("user", text);
+  history.push({ role: "user", content: text });
+  const out = addMsg("bot", "…");
+  busy = true; $("sendBtn").textContent = "Stop";
+  let full = "";
+  try {
+    const stream = await engine.chat.completions.create({ messages: history, stream: true, temperature: 0.7, max_tokens: 512 });
+    for await (const chunk of stream) {
+      full += chunk.choices[0]?.delta?.content || "";
+      out.textContent = full || "…";
+      $("chat").scrollTop = $("chat").scrollHeight;
+    }
+  } catch (e) { full += "\n[error: " + (e.message || e) + "]"; out.textContent = full; }
+  history.push({ role: "assistant", content: full });
+  // keep context small: system prompt + last 8 turns
+  if (history.length > 17) history = [history[0], ...history.slice(-16)];
+  busy = false; $("sendBtn").textContent = "Send";
+}
+$("sendBtn").onclick = send;
+$("input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+</script>
+</body>
+</html>
